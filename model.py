@@ -1,5 +1,8 @@
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
+
+from loss import FocalLoss
 
 
 class InitialBlock(nn.Module):
@@ -463,7 +466,7 @@ class UpsamplingBottleneck(nn.Module):
         return self.out_activation(out)
 
 
-class ENet(nn.Module):
+class LaneNet(nn.Module):
     """Generate the ENet model.
 
     Keyword arguments:
@@ -477,8 +480,15 @@ class ENet(nn.Module):
 
     """
 
-    def __init__(self, embed_dim, encoder_relu=False, decoder_relu=True):
+    def __init__(self, encoder_relu=False, decoder_relu=True):
         super().__init__()
+        self.w_seg = 10
+        self.w_var = 0.3
+        self.w_dist = 1
+        self.embed_dim = 3
+        self.delta_var = 0.5
+        self.delta_dist = 1.5
+        self.loss_fn = FocalLoss(gamma=2, alpha=[0.25, 0.75])
 
         self.initial_block = InitialBlock(3, 16, relu=encoder_relu)
 
@@ -582,7 +592,7 @@ class ENet(nn.Module):
             bias=False)
         self.transposed_conv_embed = nn.ConvTranspose2d(
             16,
-            2,
+            self.embed_dim,
             kernel_size=3,
             stride=2,
             padding=1,
@@ -590,7 +600,7 @@ class ENet(nn.Module):
 
         self.transposed_conv_seg = nn.ConvTranspose2d(
             16,
-            embed_dim,
+            2,
             kernel_size=3,
             stride=2,
             padding=1,
@@ -662,10 +672,16 @@ class ENet(nn.Module):
         x_embed = self.upsample5_0(x_embed, max_indices1_0, output_size=stage1_input_size)
         x_embed = self.regular5_1(x_embed)
         x_embed = self.transposed_conv_embed(x_embed, output_size=input_size)
-
+        if (seg_label is None):
+            return {
+                'seg': x_seg,
+                'embed': x_embed,
+            }
         var_loss, dist_loss, reg_loss = self.discriminative_loss(x_embed, seg_label)
-        seg_loss = self.seg_loss(x_seg, torch.gt(seg_label, 0).type(torch.long))
-        loss = seg_loss + var_loss + dist_loss
+        # seg_loss = self.seg_loss(x_seg, torch.gt(seg_label, 0).type(torch.long))
+        # print(x_seg.shape, torch.gt(seg_label, 0).type(torch.long).shape)
+        seg_loss = self.loss_fn(x_seg, torch.gt(seg_label, 0))
+        loss = seg_loss * self.w_seg + var_loss * self.w_var + dist_loss * self.w_dist
 
         return {
             'seg': x_seg,
@@ -712,7 +728,7 @@ class ENet(nn.Module):
 
                 # ---------- var_loss -------------
                 var_loss = var_loss + torch.mean(F.relu(torch.norm(embedding_i - mean_i.reshape(self.embed_dim, 1),
-                                                                   dim=0) - self.delta_v) ** 2) / num_lanes
+                                                                   dim=0) - self.delta_var) ** 2) / num_lanes
             centroid_mean = torch.stack(centroid_mean)  # (n_lane, embed_dim)
 
             if num_lanes > 1:
@@ -720,10 +736,10 @@ class ENet(nn.Module):
                 centroid_mean2 = centroid_mean.reshape(1, -1, self.embed_dim)
                 dist = torch.norm(centroid_mean1 - centroid_mean2, dim=2)  # shape (num_lanes, num_lanes)
                 dist = dist + torch.eye(num_lanes, dtype=dist.dtype,
-                                        device=dist.device) * self.delta_d  # diagonal elements are 0, now mask above delta_d
+                                        device=dist.device) * self.delta_dist  # diagonal elements are 0, now mask above delta_d
 
                 # divided by two for double calculated loss above, for implementation convenience
-                dist_loss = dist_loss + torch.sum(F.relu(-dist + self.delta_d) ** 2) / (
+                dist_loss = dist_loss + torch.sum(F.relu(-dist + self.delta_dist) ** 2) / (
                         num_lanes * (num_lanes - 1)) / 2
 
             # reg_loss is not used in original paper
